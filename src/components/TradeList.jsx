@@ -24,9 +24,10 @@ const TradeList = ({ symbol, timeframe, page, setPage }) => {
           return;
         }
 
-        const response = await axios.get("http://127.0.0.1:8000/api/backtest/", {
+        const response = await axios.get("https://forex-trading-2.onrender.com/backtest/", {
           params: { symbol, timeframe, page, limit: limitPerPage },
         });
+        
 
         if (!response.data.signals || response.data.signals.length === 0) {
           setError("No trade history available.");

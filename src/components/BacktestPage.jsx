@@ -14,9 +14,9 @@ const BacktestPage = () => {
   useEffect(() => {
     const fetchSymbols = async () => {
       try {
-        const response = await axios.get("http://127.0.0.1:8000/api/get_symbols/");
+        const response = await axios.get("https://forex-trading-2.onrender.com/get_symbols/");
         setSymbols(response.data);
-
+  
         if (Object.keys(response.data).length > 0) {
           const firstSymbol = Object.keys(response.data)[0];
           setSymbol(firstSymbol);
@@ -26,9 +26,10 @@ const BacktestPage = () => {
         console.error("❌ Error fetching symbols:", error);
       }
     };
-
+  
     fetchSymbols();
   }, []);
+
 
   return (
     <div className="trade-list container">
