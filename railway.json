@@ -1,0 +1,9 @@
+{
+    "build": {
+      "builder": "Python"
+    },
+    "deploy": {
+      "startCommand": "gunicorn forex_backtester.wsgi"
+    }
+  }
+  
