@@ -1,9 +1,15 @@
 {
-    "build": {
-      "builder": "Python"
-    },
-    "deploy": {
-      "startCommand": "gunicorn forex_backtester.wsgi"
+    "nixpacksPlan": {
+      "phases": {
+        "install": {
+          "cmds": [
+            "pip install -r requirements.txt"
+          ]
+        },
+        "start": {
+          "cmd": "gunicorn forex_backtester.wsgi"
+        }
+      }
     }
   }
   
