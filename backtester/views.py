@@ -1,154 +1,167 @@
-import requests
-import numpy as np
+import os
 import pandas as pd
+import numpy as np
+import re
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.utils.dateparse import parse_datetime
-from .models import ForexData
+from django.conf import settings
 
-# Replace with your actual Twelve Data API Key
-API_KEY = '05767e9cf5f44b6aa42ad342d4955fc8'
-BASE_URL = 'https://api.twelvedata.com/time_series'
-
-# Define all valid Forex pairs
-VALID_PAIRS = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "XAUUSD"}
-
-# Starting capital for backtesting
+# Folder where CSV files are stored
+DATA_FOLDER = os.path.join(settings.BASE_DIR, "data")
 STARTING_CAPITAL = 100000
-RISK_PER_TRADE = 0.02  # 2% of capital per trade
+RISK_PER_TRADE = 0.02
+MAX_TRADE_SIZE = 100000
+loaded_data = {}
 
+def get_available_symbols(request):
+    """Fetch available symbols & timeframes from the 'data/' folder."""
+    symbol_data = {}
+    pattern = re.compile(r"([A-Z]+)(\d+MIN|\d+H|DAY)\.csv")
 
-@csrf_exempt
-def fetch_forex_data(request):
-    """Fetches Forex data for all valid pairs and stores new records in the database."""
-    interval = request.GET.get('interval', '5min')
-    total_fetched = 0
+    if not os.path.exists(DATA_FOLDER):
+        return JsonResponse({"error": "Data folder not found"}, status=404)
 
-    for pair in VALID_PAIRS:
-        params = {
-            'symbol': pair,
-            'interval': interval,
-            'apikey': API_KEY,
-            'outputsize': '100'
-        }
+    for filename in os.listdir(DATA_FOLDER):
+        match = pattern.match(filename)
+        if match:
+            symbol, timeframe = match.groups()
+            symbol_data.setdefault(symbol, {})[timeframe] = filename
 
-        try:
-            response = requests.get(BASE_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as e:
-            return JsonResponse({"error": f"API request failed for {pair}", "details": str(e)}, status=500)
+    return JsonResponse(symbol_data)
 
-        if "values" not in data or not data["values"]:
-            continue  # Skip if no data found
+def load_forex_data(symbol, timeframe):
+    """Loads forex data from a CSV file and ensures correct headers."""
+    if symbol in loaded_data and timeframe in loaded_data[symbol]:
+        return loaded_data[symbol][timeframe]
 
-        # Store only new records
-        existing_timestamps = set(ForexData.objects.filter(currency_pair=pair).values_list('timestamp', flat=True))
-        records = [
-            ForexData(
-                currency_pair=pair,
-                timestamp=parse_datetime(entry["datetime"]),
-                open_price=float(entry["open"]),
-                high_price=float(entry["high"]),
-                low_price=float(entry["low"]),
-                close_price=float(entry["close"]),
-                volume=float(entry.get("volume", 0))
-            )
-            for entry in data["values"]
-            if parse_datetime(entry["datetime"]) not in existing_timestamps
-        ]
+    filename = f"{symbol}{timeframe}.csv"
+    filepath = os.path.join(DATA_FOLDER, filename)
 
-        if records:
-            ForexData.objects.bulk_create(records)
-            total_fetched += len(records)
+    if not os.path.exists(filepath):
+        print(f"❌ File not found: {filepath}")
+        return None
 
-    return JsonResponse({"message": f"Fetched {total_fetched} new records across all pairs."})
+    try:
+        # Read CSV with explicit tab separator
+        df = pd.read_csv(filepath, sep="\t", names=["timestamp", "open", "high", "low", "close", "volume"])
 
+        # Ensure numeric columns are correctly parsed
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors="coerce")
+        df.dropna(inplace=True)
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df.dropna(subset=["timestamp"], inplace=True)
+        df.sort_values(by="timestamp", inplace=True)
+
+        if df.empty:
+            print(f"⚠️ CSV {filename} is empty or has invalid data!")
+            return None
+
+        df["EMA"] = df["close"].ewm(span=5, adjust=False).mean()
+        df.dropna(subset=["EMA"], inplace=True)
+
+        loaded_data.setdefault(symbol, {})[timeframe] = df
+        return df
+
+    except Exception as e:
+        print(f"❌ Error loading file {filepath}: {e}")
+        return None
 
 @csrf_exempt
 def backtest_strategy(request):
-    """Backtests the 5 EMA strategy on all stored Forex data for all available pairs."""
-    all_pairs = ForexData.objects.values_list("currency_pair", flat=True).distinct()
-    all_signals = []
-    capital = STARTING_CAPITAL  # Start with $100,000
-    total_profit_loss = 0.0
+    """Backtesting function with wick-to-body ratio check for stronger signals."""
+    try:
+        symbol = request.GET.get("symbol", "").upper()
+        timeframe = request.GET.get("timeframe", "").upper()
+        page = int(request.GET.get("page", 1))
+        limit = int(request.GET.get("limit", 20))
 
-    if not all_pairs:
-        return JsonResponse({"error": "No forex data available in the database."}, status=404)
+        print(f"📡 Received Request: symbol={symbol}, timeframe={timeframe}, page={page}, limit={limit}")
 
-    for pair in all_pairs:
-        forex_data = ForexData.objects.filter(currency_pair=pair).order_by("timestamp")
-        if not forex_data.exists():
-            continue  # Skip if no data found for this pair
+        if not symbol or not timeframe:
+            return JsonResponse({"error": "Symbol and timeframe are required"}, status=400)
 
-        df = pd.DataFrame(list(forex_data.values()))
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.sort_values(by='timestamp', inplace=True)
+        filename = f"{symbol}{timeframe}.csv"
+        filepath = os.path.join(DATA_FOLDER, filename)
 
-        # Compute 5 EMA
-        df['EMA'] = df['close_price'].ewm(span=5, adjust=False).mean()
+        if not os.path.exists(filepath):
+            return JsonResponse({"error": f"Invalid symbol or timeframe: {symbol}, {timeframe}"}, status=400)
 
-        pair_signals = []
-        pair_profit_loss = 0.0
+        df = load_forex_data(symbol, timeframe)
+        if df is None or df.empty:
+            return JsonResponse({"error": "Data unavailable."}, status=400)
+
+        all_signals = []
+        capital = STARTING_CAPITAL
 
         for i in range(1, len(df) - 1):
             prev, curr, nxt = df.iloc[i - 1], df.iloc[i], df.iloc[i + 1]
-            if np.isnan(prev['EMA']):
-                continue  # Skip if EMA not yet calculated
 
-            trade_type = None
-            entry_price = None
-            stop_loss = None
-            target = None
-            profit = None
+            if np.isnan(prev["EMA"]):
+                continue
 
-            # Buy Entry Condition
-            if prev['low_price'] > prev['EMA'] and nxt['close_price'] > nxt['open_price']:
-                trade_type = "BUY"
-                entry_price = nxt['open_price']
-                stop_loss = entry_price * 0.95
-                target = entry_price * 1.15
-                profit = target - entry_price
+            trade_type, entry_price, stop_loss, target, profit = None, None, None, None, None
 
-            # Sell Entry Condition
-            elif prev['high_price'] < prev['EMA'] and nxt['close_price'] < nxt['open_price']:
-                trade_type = "SELL"
-                entry_price = nxt['open_price']
-                stop_loss = entry_price * 1.05
-                target = entry_price * 0.85
-                profit = entry_price - target
+            # Calculate wick and body size
+            upper_wick = prev["high"] - max(prev["open"], prev["close"])
+            lower_wick = min(prev["open"], prev["close"]) - prev["low"]
+            body_size = abs(prev["open"] - prev["close"])
+
+            # SELL SIGNAL - Candle fully above EMA, upper wick larger than body, next candle red
+            if prev["close"] > prev["EMA"] and prev["open"] > prev["EMA"] and prev["low"] > prev["EMA"]:
+                if upper_wick > body_size and nxt["close"] < nxt["open"]:  # Long wick & next red candle
+                    trade_type = "SELL"
+                    entry_price = nxt["open"]
+                    stop_loss = entry_price * 1.01  # 1% Stop Loss
+                    target = entry_price * 0.97  # 3% Target
+                    profit = entry_price - target
+
+            # BUY SIGNAL - Candle fully below EMA, lower wick larger than body, next candle green
+            elif prev["close"] < prev["EMA"] and prev["open"] < prev["EMA"] and prev["high"] < prev["EMA"]:
+                if lower_wick > body_size and nxt["close"] > nxt["open"]:  # Long wick & next green candle
+                    trade_type = "BUY"
+                    entry_price = nxt["open"]
+                    stop_loss = entry_price * 0.99  # 1% Stop Loss
+                    target = entry_price * 1.03  # 3% Target
+                    profit = target - entry_price
 
             if trade_type:
                 risk = abs(stop_loss - entry_price)
-                risk_reward = round(profit / risk, 2) if risk != 0 else None
-                risk_amount = capital * RISK_PER_TRADE  # 2% of capital risked per trade
-                trade_size = risk_amount / risk if risk != 0 else 0
-                trade_profit = trade_size * profit if trade_size != 0 else 0
+                if risk == 0:
+                    continue
 
-                capital += trade_profit  # Update capital based on profit/loss
-                pair_profit_loss += trade_profit
+                risk_amount = capital * RISK_PER_TRADE
+                trade_size = np.clip(risk_amount / risk, 1, MAX_TRADE_SIZE)
+                trade_profit = trade_size * profit
+                capital = max(capital + trade_profit, 0)
 
-                pair_signals.append({
-                    "pair": pair,
+                all_signals.append({
+                    "timestamp": nxt["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
                     "type": trade_type,
-                    "timestamp": nxt['timestamp'].strftime("%Y-%m-%d %H:%M:%S"),
                     "entry_price": round(entry_price, 5),
-                    "target": round(target, 5),
                     "stop_loss": round(stop_loss, 5),
+                    "target": round(target, 5),
                     "profit_loss": round(trade_profit, 5),
-                    "risk_reward": risk_reward,
                     "capital": round(capital, 2)
                 })
 
-        total_profit_loss += pair_profit_loss
-        all_signals.append({
-            "pair": pair,
-            "total_trades": len(pair_signals),
-            "total_profit_loss": round(pair_profit_loss, 5),
-            "signals": pair_signals
-        })
+        total_signals = len(all_signals)
+        total_pages = (total_signals // limit) + (1 if total_signals % limit else 0)
+        start_index = (page - 1) * limit
+        end_index = min(start_index + limit, total_signals)
+        paginated_signals = all_signals[start_index:end_index]
 
-    return JsonResponse({
-        "summary": {"total_profit_loss": round(total_profit_loss, 5), "final_capital": round(capital, 2)},
-        "details": all_signals
-    })
+        return JsonResponse({
+            "summary": {
+                "total_profit_loss": round(sum(s["profit_loss"] for s in all_signals), 5),
+                "final_capital": round(all_signals[-1]["capital"], 2) if all_signals else STARTING_CAPITAL,
+                "total_signals": total_signals,
+                "current_page": page,
+                "total_pages": total_pages, 
+            },
+            "signals": paginated_signals
+        })
+    except Exception as e:
+        print(f"❌ Server error: {e}") 
+        return JsonResponse({"error": f"Server error: {e}"}, status=500)

@@ -1,0 +1,153 @@
+venv\Scripts\activate
+cd forex_backtester
+py manage.py runserver
+
+
+
+
+import pandas as pd
+import numpy as np
+import os
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+
+# CSV Directory
+DATA_DIR = "C:/learning-project/forex-tarding/forex_backtester/data"
+
+# Available timeframes and their corresponding files
+VALID_TIMEFRAMES = {
+    "5MIN": "EURUSD5MIN.csv",
+    "15MIN": "EURUSD15MIN.csv",
+    "DAILY": "EURUSDAY.csv",
+}
+
+# Trading Constants
+STARTING_CAPITAL = 100000
+RISK_PER_TRADE = 0.02  # 2% risk per trade
+MAX_TRADE_SIZE = 100000  # Prevent unrealistic trade sizes
+
+
+def load_forex_data(timeframe):
+    """Loads forex data from a CSV file based on the selected timeframe."""
+    file_name = VALID_TIMEFRAMES.get(timeframe)
+    if not file_name:
+        return None
+
+    file_path = os.path.join(DATA_DIR, file_name)
+    if not os.path.exists(file_path):
+        return None
+
+    try:
+        df = pd.read_csv(file_path, sep="\t", names=["timestamp", "open", "high", "low", "close", "volume"], header=None)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df.dropna(subset=["timestamp"], inplace=True)
+        df.sort_values(by="timestamp", inplace=True)
+
+        if df.empty:
+            return None
+
+        return df
+    except Exception as e:
+        print(f"❌ Error loading file {file_path}: {e}")
+        return None
+
+
+@csrf_exempt
+def backtest_strategy(request):
+    """Backtests the 5 EMA strategy and returns paginated results."""
+    try:
+        # Get request parameters
+        timeframe = request.GET.get("timeframe", "5MIN").upper()
+        page = int(request.GET.get("page", 1))
+        limit = int(request.GET.get("limit", 50))
+
+        # Load data
+        df = load_forex_data(timeframe)
+        if df is None or df.empty:
+            return JsonResponse({"error": "Invalid timeframe or missing data."}, status=400)
+
+        # Calculate 5 EMA
+        df['EMA'] = df['close'].ewm(span=5, adjust=False).mean()
+
+        capital = STARTING_CAPITAL
+        total_profit_loss = 0.0
+        signals = []
+
+        for i in range(1, len(df) - 1):  # Avoid index out of bounds
+            prev, curr, nxt = df.iloc[i - 1], df.iloc[i], df.iloc[i + 1]
+            if np.isnan(prev['EMA']):
+                continue
+
+            trade_type, entry_price, stop_loss, target, profit = None, None, None, None, None
+
+            # Calculate candle body and wick size
+            candle_body = abs(prev['close'] - prev['open'])
+            upper_wick = prev['high'] - max(prev['close'], prev['open'])
+            lower_wick = min(prev['close'], prev['open']) - prev['low']
+
+            # **SELL Condition**
+            if (prev['high'] > prev['EMA']  # Candle is above EMA
+                    and prev['low'] > prev['EMA']  # Candle does NOT touch EMA
+                    and upper_wick > candle_body  # Wick is larger than body
+                    and nxt['close'] < nxt['open']):  # Next candle is red
+                trade_type = "SELL"
+                entry_price = nxt['open']
+                stop_loss = entry_price * 1.05  # Stop Loss at +5%
+                target = entry_price * 0.80  # Target at -20%
+                profit = entry_price - target
+
+            # **BUY Condition**
+            elif (prev['low'] < prev['EMA']  # Candle is below EMA
+                  and prev['high'] < prev['EMA']  # Candle does NOT touch EMA
+                  and lower_wick > candle_body  # Wick is larger than body
+                  and nxt['close'] > nxt['open']):  # Next candle is green
+                trade_type = "BUY"
+                entry_price = nxt['open']
+                stop_loss = entry_price * 0.95  # Stop Loss at -5%
+                target = entry_price * 1.20  # Target at +20%
+                profit = target - entry_price
+
+            if trade_type:
+                risk = abs(stop_loss - entry_price)
+
+                if risk == 0:
+                    continue  # Skip trade if risk is zero to avoid division errors
+
+                risk_amount = capital * RISK_PER_TRADE
+                trade_size = risk_amount / risk
+                trade_size = np.clip(trade_size, 1, MAX_TRADE_SIZE)  # Cap max trade size
+
+                trade_profit = trade_size * profit if trade_size != 0 else 0
+                trade_profit = np.clip(trade_profit, -capital, capital)  # Prevent overflow
+
+                capital = np.clip(capital + trade_profit, 0, np.inf)  # Ensure capital stays valid
+                total_profit_loss += trade_profit
+
+                signals.append({
+                    "timestamp": nxt['timestamp'].strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": trade_type,
+                    "entry_price": round(entry_price, 5),
+                    "stop_loss": round(stop_loss, 5),
+                    "target": round(target, 5),
+                    "profit_loss": round(trade_profit, 5),
+                    "capital": round(capital, 2)
+                })
+
+        # Pagination Logic
+        total_signals = len(signals)
+        total_pages = (total_signals // limit) + (1 if total_signals % limit else 0)
+        paginated_signals = signals[(page - 1) * limit : page * limit]
+
+        return JsonResponse({
+            "summary": {
+                "total_profit_loss": round(total_profit_loss, 5),
+                "final_capital": round(capital, 2),
+                "total_signals": total_signals,
+                "current_page": page,
+                "total_pages": total_pages,
+            },
+            "signals": paginated_signals
+        })
+
+    except Exception as e:
+        return JsonResponse({"error": f"Server error: {e}"}, status=500)
